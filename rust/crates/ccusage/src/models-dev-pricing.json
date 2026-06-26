@@ -1075,6 +1075,7 @@
 	"claude-3-7-sonnet": {
 		"cost": {
 			"cache_read": 0.3,
+			"cache_write": 3.75,
 			"input": 3,
 			"output": 15
 		},
@@ -1107,6 +1108,7 @@
 	"claude-3-opus": {
 		"cost": {
 			"cache_read": 1.5,
+			"cache_write": 18.75,
 			"input": 15,
 			"output": 75
 		},
