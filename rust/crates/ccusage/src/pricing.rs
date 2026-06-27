@@ -1,5 +1,7 @@
 use std::{
     borrow::Cow,
+    fs,
+    path::PathBuf,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -21,6 +23,9 @@ const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
 const PRICING_FETCH_TIMEOUT_SECONDS: u64 = 10;
 const PRICING_FETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MODELS_DEV_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(60);
+const PRICING_CACHE_DIR: &[&str] = &[".config", "ccusage"];
+const LITELLM_CACHE_FILENAME: &str = "litellm-pricing.json";
+const MODELS_DEV_CACHE_FILENAME: &str = "models-dev-pricing.json";
 // Anthropic date-suffixed model aliases use YYYYMMDD, while other numeric
 // suffixes are treated as distinct model versions.
 const MODEL_DATE_SUFFIX_DIGITS: usize = 8;
@@ -215,7 +220,8 @@ impl PricingMap {
         I: IntoIterator<Item = (&'a String, &'a PricingOverride)>,
     {
         let mut map = Self::load_embedded();
-        if !offline {
+
+        let litellm_json: Option<String> = if !offline {
             let fetch_result = crate::progress::track_status(
                 log && crate::progress::usage_load_output_is_tty(),
                 "Refreshing model pricing from LiteLLM...",
@@ -223,23 +229,29 @@ impl PricingMap {
             );
 
             match fetch_result {
-                Ok(json) => {
-                    let loaded_count = map.load_json(&json);
-                    if loaded_count == 0 && should_log_pricing_refresh_details() {
-                        eprintln!("WARN  Failed to parse LiteLLM pricing; using embedded pricing.");
-                    }
-                }
+                Ok(json) => Some(json),
                 Err(error) => {
                     if should_log_pricing_refresh_details() {
                         eprintln!(
-                            "WARN  Failed to fetch LiteLLM pricing ({error}); using embedded pricing."
+                            "WARN  Failed to fetch LiteLLM pricing ({error}); trying local cache."
                         );
                     }
+                    read_pricing_cache(LITELLM_CACHE_FILENAME)
                 }
+            }
+        } else {
+            read_pricing_cache(LITELLM_CACHE_FILENAME)
+        };
+
+        if let Some(ref json) = litellm_json {
+            let loaded_count = map.load_json(json);
+            if loaded_count == 0 && should_log_pricing_refresh_details() {
+                eprintln!("WARN  Failed to parse LiteLLM pricing; using embedded pricing.");
             }
         }
 
-        map.enable_models_dev_fallback = !offline;
+        map.enable_models_dev_fallback =
+            !offline || read_pricing_cache(MODELS_DEV_CACHE_FILENAME).is_some();
         map.apply_overrides(overrides);
         map
     }
@@ -1216,11 +1228,27 @@ where
 }
 
 fn fetch_pricing_json() -> std::io::Result<String> {
-    fetch_json_url(LITELLM_PRICING_URL)
+    let json = fetch_json_url(LITELLM_PRICING_URL)?;
+    write_pricing_cache(LITELLM_CACHE_FILENAME, &json);
+    Ok(json)
 }
 
 fn fetch_models_dev_json() -> std::io::Result<String> {
-    fetch_json_url(MODELS_DEV_API_URL)
+    match fetch_json_url(MODELS_DEV_API_URL) {
+        Ok(json) => {
+            write_pricing_cache(MODELS_DEV_CACHE_FILENAME, &json);
+            Ok(json)
+        }
+        Err(network_error) => {
+            // Fall back to local cache when the network is unavailable so that
+            // offline runs still benefit from models.dev pricing data.
+            if let Some(cached) = read_pricing_cache(MODELS_DEV_CACHE_FILENAME) {
+                Ok(cached)
+            } else {
+                Err(network_error)
+            }
+        }
+    }
 }
 
 fn fetch_json_url(url: &str) -> std::io::Result<String> {
@@ -1244,6 +1272,42 @@ fn fetch_json_url(url: &str) -> std::io::Result<String> {
         .limit(PRICING_FETCH_MAX_BYTES)
         .read_to_string()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn pricing_cache_dir() -> Option<PathBuf> {
+    let mut path = crate::home::home_dir()?;
+    for component in PRICING_CACHE_DIR {
+        path = path.join(component);
+    }
+    Some(path)
+}
+
+fn write_pricing_cache(filename: &str, json: &str) {
+    let Some(dir) = pricing_cache_dir() else {
+        return;
+    };
+    if let Err(error) = fs::create_dir_all(&dir) {
+        if should_log_pricing_refresh_details() {
+            eprintln!("WARN  Failed to create pricing cache directory {dir:?}: {error}");
+        }
+        return;
+    }
+    let path = dir.join(filename);
+    if let Err(error) = fs::write(&path, json) {
+        if should_log_pricing_refresh_details() {
+            eprintln!("WARN  Failed to write pricing cache {path:?}: {error}");
+        }
+    }
+}
+
+fn read_pricing_cache(filename: &str) -> Option<String> {
+    let dir = pricing_cache_dir()?;
+    let path = dir.join(filename);
+    match fs::read_to_string(&path) {
+        Ok(content) if !content.trim().is_empty() => Some(content),
+        Ok(_) => None,
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -2388,6 +2452,95 @@ mod tests {
             assert_eq!(entry.cache_read, 5e-7); // explicit value, not 2e-7
             // cache_create still scaled since not explicitly provided
             assert!((entry.cache_create - 2.5e-6).abs() < 1e-15);
+        }
+    }
+
+    mod pricing_cache {
+        use super::super::{
+            LITELLM_CACHE_FILENAME, MODELS_DEV_CACHE_FILENAME, read_pricing_cache,
+            write_pricing_cache,
+        };
+        use std::fs;
+
+        fn cache_cleanup_guard() -> CacheCleanup {
+            CacheCleanup::new()
+        }
+
+        struct CacheCleanup {
+            litellm_existed: bool,
+            models_dev_existed: bool,
+            litellm_backup: Option<String>,
+            models_dev_backup: Option<String>,
+        }
+
+        impl CacheCleanup {
+            fn new() -> Self {
+                let litellm_backup = read_pricing_cache(LITELLM_CACHE_FILENAME);
+                let models_dev_backup = read_pricing_cache(MODELS_DEV_CACHE_FILENAME);
+                Self {
+                    litellm_existed: litellm_backup.is_some(),
+                    models_dev_existed: models_dev_backup.is_some(),
+                    litellm_backup,
+                    models_dev_backup,
+                }
+            }
+        }
+
+        impl Drop for CacheCleanup {
+            fn drop(&mut self) {
+                if let Some(dir) = super::super::pricing_cache_dir() {
+                    let litellm_path = dir.join(LITELLM_CACHE_FILENAME);
+                    let models_dev_path = dir.join(MODELS_DEV_CACHE_FILENAME);
+                    if !self.litellm_existed {
+                        let _ = fs::remove_file(&litellm_path);
+                    } else if let Some(ref content) = self.litellm_backup {
+                        let _ = fs::write(&litellm_path, content);
+                    }
+                    if !self.models_dev_existed {
+                        let _ = fs::remove_file(&models_dev_path);
+                    } else if let Some(ref content) = self.models_dev_backup {
+                        let _ = fs::write(&models_dev_path, content);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn writes_and_reads_litellm_cache() {
+            let _cleanup = cache_cleanup_guard();
+            let json = r#"{"test-model":{"input_cost_per_token":1e-6,"output_cost_per_token":2e-6}}"#;
+
+            write_pricing_cache(LITELLM_CACHE_FILENAME, json);
+            let cached = read_pricing_cache(LITELLM_CACHE_FILENAME).expect("cache should exist");
+            assert_eq!(cached, json);
+        }
+
+        #[test]
+        fn writes_and_reads_models_dev_cache() {
+            let _cleanup = cache_cleanup_guard();
+            let json = r#"{"test":{"id":"test","cost":{"input":1.0,"output":2.0}}}"#;
+
+            write_pricing_cache(MODELS_DEV_CACHE_FILENAME, json);
+            let cached =
+                read_pricing_cache(MODELS_DEV_CACHE_FILENAME).expect("cache should exist");
+            assert_eq!(cached, json);
+        }
+
+        #[test]
+        fn read_returns_none_for_missing_cache() {
+            let _cleanup = cache_cleanup_guard();
+            // Remove any existing cache first
+            if let Some(dir) = super::super::pricing_cache_dir() {
+                let _ = fs::remove_file(dir.join(LITELLM_CACHE_FILENAME));
+            }
+            assert!(read_pricing_cache(LITELLM_CACHE_FILENAME).is_none());
+        }
+
+        #[test]
+        fn read_returns_none_for_empty_cache_file() {
+            let _cleanup = cache_cleanup_guard();
+            write_pricing_cache(LITELLM_CACHE_FILENAME, "   \n  ");
+            assert!(read_pricing_cache(LITELLM_CACHE_FILENAME).is_none());
         }
     }
 }

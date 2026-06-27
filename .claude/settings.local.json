@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(CCUSAGE_PRICING_JSON_PATH=/tmp/litellm-pricing.json cargo test -p ccusage pricing::tests::pricing_cache)",
+      "Bash(CCUSAGE_PRICING_JSON_PATH=/tmp/litellm-pricing.json cargo test -p ccusage)",
+      "Bash(CCUSAGE_PRICING_JSON_PATH=/tmp/litellm-pricing.json cargo test -p ccusage-cli)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "context7",
+    "grep"
+  ]
+}
