@@ -459,10 +459,7 @@ fn render_statusline(
         .map(|entries| identify_session_blocks(entries, DEFAULT_SESSION_DURATION_HOURS))
         .unwrap_or_default();
     let active_block = blocks.iter().find(|block| block.is_active && !block.is_gap);
-    let (block_info, burn_rate_info) = if args.no_block {
-        // 如果指定了 --no-block，不显示 block 信息
-        (String::new(), String::new())
-    } else if let Some(block) = active_block {
+    let (block_info, burn_rate_info) = if let Some(block) = active_block {
         let remaining = block.end_time.duration_since(utc_now()) / MILLIS_PER_MINUTE;
         let mut burn = String::new();
         if let Some(rate) = calculate_burn_rate(block) {
@@ -488,14 +485,17 @@ fn render_statusline(
             }
             burn = format!(" | 🔥 {}", segments.join(" "));
         }
-        (
+        // --no-block 只隐藏 block 信息，保留燃烧率
+        let block_display = if args.no_block {
+            String::new()
+        } else {
             format!(
                 "{} block ({})",
                 format_currency(block.cost_usd),
                 format_remaining_time(remaining)
-            ),
-            burn,
-        )
+            )
+        };
+        (block_display, burn)
     } else {
         ("No active block".to_string(), String::new())
     };
@@ -537,13 +537,25 @@ fn render_statusline(
 
     // 根据是否显示 block 信息调整输出格式
     if args.no_block {
-        Ok(format!(
-            "🤖 {} | 💰 {} session / {} today | 🧠 {}",
-            model_label,
-            session_display,
-            format_currency(today_cost),
-            context_info.unwrap_or_else(|| "N/A".to_string())
-        ))
+        // --no-block: 隐藏 block 信息，但保留燃烧率
+        if burn_rate_info.is_empty() {
+            Ok(format!(
+                "🤖 {} | 💰 {} session / {} today | 🧠 {}",
+                model_label,
+                session_display,
+                format_currency(today_cost),
+                context_info.unwrap_or_else(|| "N/A".to_string())
+            ))
+        } else {
+            Ok(format!(
+                "🤖 {} | 💰 {} session / {} today{} | 🧠 {}",
+                model_label,
+                session_display,
+                format_currency(today_cost),
+                burn_rate_info,
+                context_info.unwrap_or_else(|| "N/A".to_string())
+            ))
+        }
     } else {
         Ok(format!(
             "🤖 {} | 💰 {} session / {} today / {}{} | 🧠 {}",
@@ -571,17 +583,6 @@ fn statusline_today_shared(
         timezone: args.timezone.clone(),
         ..SharedArgs::default()
     }
-}
-
-fn calculate_session_cost(session_id: &str, shared: &SharedArgs) -> Result<f64> {
-    Ok(load_entries(shared, None)?
-        .into_iter()
-        .filter(|entry| {
-            entry.data.session_id.as_deref() == Some(session_id)
-                || entry.session_id.as_ref() == session_id
-        })
-        .map(|entry| entry.cost)
-        .sum())
 }
 
 fn calculate_session_cost_from_entries(session_id: &str, entries: &[LoadedEntry]) -> f64 {

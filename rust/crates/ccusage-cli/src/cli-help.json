@@ -303,6 +303,11 @@
 			"default": "false"
 		},
 		{
+			"flags": "--no-parse-cache",
+			"description": "Disable disk cache for parsed usage entries",
+			"default": "false"
+		},
+		{
 			"flags": "--color",
 			"description": "Enable colored output. FORCE_COLOR=1 has the same effect.",
 			"default": "auto"

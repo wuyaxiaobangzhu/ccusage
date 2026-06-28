@@ -2,6 +2,7 @@ use std::{fmt, io};
 
 mod adapter;
 mod blocks;
+mod cache;
 mod cli;
 mod commands;
 mod config;

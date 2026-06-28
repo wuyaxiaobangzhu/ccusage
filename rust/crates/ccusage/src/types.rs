@@ -56,7 +56,7 @@ pub(crate) struct CacheCreationRaw {
     pub(crate) ephemeral_1h_input_tokens: u64,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Speed {
     Standard,

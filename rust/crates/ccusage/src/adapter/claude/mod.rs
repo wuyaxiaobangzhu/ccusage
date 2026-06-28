@@ -82,13 +82,14 @@ fn load_entries_inner(
     };
     let tz = parse_tz(shared.timezone.as_deref());
     let mode = shared.mode;
+    let use_cache = !shared.no_parse_cache;
     let loaded_files = if shared.single_thread {
         files
             .iter()
-            .map(|file| read_usage_file(file, tz.as_ref(), mode, pricing.as_ref()))
+            .map(|file| read_usage_file(file, tz.as_ref(), mode, pricing.as_ref(), use_cache))
             .collect::<Vec<_>>()
     } else {
-        read_usage_files_parallel(&files, tz.as_ref(), mode, pricing.as_ref())
+        read_usage_files_parallel(&files, tz.as_ref(), mode, pricing.as_ref(), use_cache)
     };
     let loaded_entry_count = loaded_files
         .iter()
@@ -168,6 +169,7 @@ fn read_usage_files_parallel(
     tz: Option<&JiffTimeZone>,
     mode: CostMode,
     pricing: Option<&PricingMap>,
+    use_cache: bool,
 ) -> Vec<LoadedFile> {
     let worker_count = thread::available_parallelism()
         .map(usize::from)
@@ -176,7 +178,7 @@ fn read_usage_files_parallel(
     if worker_count <= 1 {
         return files
             .iter()
-            .map(|file| read_usage_file(file, tz, mode, pricing))
+            .map(|file| read_usage_file(file, tz, mode, pricing, use_cache))
             .collect();
     }
 
@@ -191,7 +193,7 @@ fn read_usage_files_parallel(
                     .map(|index| {
                         (
                             index,
-                            read_usage_file(&files[index], tz.as_ref(), mode, pricing),
+                            read_usage_file(&files[index], tz.as_ref(), mode, pricing, use_cache),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -334,7 +336,16 @@ fn read_usage_file(
     tz: Option<&JiffTimeZone>,
     mode: CostMode,
     pricing: Option<&PricingMap>,
+    use_cache: bool,
 ) -> LoadedFile {
+    // Try cache first — if the source file hasn't changed, we can skip
+    // all JSON parsing and just deserialize the cached entries.
+    if use_cache {
+        if let Some(cached) = crate::cache::try_load_cached(path, mode, pricing) {
+            return cached;
+        }
+    }
+
     let project: Arc<str> = Arc::from(extract_project(path));
     let (session_id, project_path) = extract_session_parts(path);
     let session_id: Arc<str> = Arc::from(session_id);
@@ -401,6 +412,12 @@ fn read_usage_file(
             missing_pricing_model,
         });
     }
+
+    // Write cache after successful parse (best-effort, failures are silent).
+    if use_cache {
+        crate::cache::write_loaded_file_cache(path, &loaded_file);
+    }
+
     loaded_file
 }
 

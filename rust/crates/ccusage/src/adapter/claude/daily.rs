@@ -46,13 +46,14 @@ pub(super) fn load_daily_summaries_inner(
     };
     let tz = parse_tz(shared.timezone.as_deref());
     let mode = shared.mode;
+    let use_cache = !shared.no_parse_cache;
     let loaded_files = if shared.single_thread {
         files
             .iter()
-            .map(|file| read_daily_usage_file(file, tz.as_ref(), mode, pricing.as_ref()))
+            .map(|file| read_daily_usage_file(file, tz.as_ref(), mode, pricing.as_ref(), use_cache))
             .collect::<Vec<_>>()
     } else {
-        read_daily_usage_files_parallel(&files, tz.as_ref(), mode, pricing.as_ref())
+        read_daily_usage_files_parallel(&files, tz.as_ref(), mode, pricing.as_ref(), use_cache)
     };
 
     let mut deduped_indexes: FxHashMap<u64, SmallIndexVec> = FxHashMap::default();
@@ -193,6 +194,7 @@ fn read_daily_usage_files_parallel(
     tz: Option<&JiffTimeZone>,
     mode: CostMode,
     pricing: Option<&PricingMap>,
+    use_cache: bool,
 ) -> Vec<DailyLoadedFile> {
     let worker_count = thread::available_parallelism()
         .map(usize::from)
@@ -201,7 +203,7 @@ fn read_daily_usage_files_parallel(
     if worker_count <= 1 {
         return files
             .iter()
-            .map(|file| read_daily_usage_file(file, tz, mode, pricing))
+            .map(|file| read_daily_usage_file(file, tz, mode, pricing, use_cache))
             .collect();
     }
 
@@ -216,7 +218,7 @@ fn read_daily_usage_files_parallel(
                     .map(|index| {
                         (
                             index,
-                            read_daily_usage_file(&files[index], tz.as_ref(), mode, pricing),
+                            read_daily_usage_file(&files[index], tz.as_ref(), mode, pricing, use_cache),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -242,7 +244,38 @@ fn read_daily_usage_file(
     tz: Option<&JiffTimeZone>,
     mode: CostMode,
     pricing: Option<&PricingMap>,
+    use_cache: bool,
 ) -> DailyLoadedFile {
+    // Try cache first.
+    if use_cache {
+        if let Some(cache) = crate::cache::read_daily_file_cache(path) {
+            let entries = cache
+                .entries
+                .into_iter()
+                .map(|cached| {
+                    let usage = cached.to_token_usage();
+                    DailyLoadedEntry {
+                        date: cached.date,
+                        project: Arc::from(cached.project.as_str()),
+                        usage,
+                        cost: cached.cost,
+                        model: cached.model,
+                        missing_pricing_model: cached.missing_pricing_model,
+                        message_id: cached.message_id,
+                        request_id: cached.request_id,
+                        is_sidechain: cached.is_sidechain,
+                    }
+                })
+                .collect();
+            // Recover the file-level timestamp from entries if needed
+            // (daily path doesn't strictly need it for summaries).
+            return DailyLoadedFile {
+                timestamp: None,
+                entries,
+            };
+        }
+    }
+
     let project: Arc<str> = Arc::from(extract_project(path));
     let mut loaded_file = DailyLoadedFile {
         timestamp: None,
@@ -251,6 +284,8 @@ fn read_daily_usage_file(
     let Ok(content) = fs::read(path) else {
         return loaded_file;
     };
+
+    let mut cached_entries: Vec<crate::cache::CachedDailyEntry> = Vec::new();
 
     let usage_marker = memmem::Finder::new(br#""usage":{"#);
     for line in byte_lines(&content) {
@@ -299,8 +334,22 @@ fn read_daily_usage_file(
                 Some(model.clone())
             }
         });
+        let date = format_date_tz(timestamp, tz);
+        if use_cache {
+            cached_entries.push(crate::cache::CachedDailyEntry::from_daily_fields(
+                date.clone(),
+                &project,
+                usage,
+                cost,
+                model.clone(),
+                missing_pricing_model.clone(),
+                data.message.id.clone(),
+                data.request_id.clone(),
+                data.is_sidechain,
+            ));
+        }
         loaded_file.entries.push(DailyLoadedEntry {
-            date: format_date_tz(timestamp, tz),
+            date,
             project: Arc::clone(&project),
             usage,
             cost,
@@ -311,6 +360,12 @@ fn read_daily_usage_file(
             is_sidechain: data.is_sidechain,
         });
     }
+
+    // Write cache after successful parse (best-effort, failures are silent).
+    if use_cache {
+        crate::cache::write_daily_file_cache(path, &cached_entries);
+    }
+
     loaded_file
 }
 
