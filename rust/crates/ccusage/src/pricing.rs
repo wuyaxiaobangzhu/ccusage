@@ -11,7 +11,7 @@ use ccusage_cli::PricingOverride;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::fast::FxHashMap;
+use crate::fast::{FxHashMap, FxHashSet};
 
 const BUILD_TIME_PRICING_JSON: &str =
     include_str!(concat!(env!("OUT_DIR"), "/litellm-pricing.json"));
@@ -24,6 +24,8 @@ const PRICING_FETCH_TIMEOUT_SECONDS: u64 = 10;
 const PRICING_FETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MODELS_DEV_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(60);
 const PRICING_CACHE_DIR: &[&str] = &[".config", "ccusage"];
+const FILTERED_CACHE_FILENAME: &str = "pricing-filtered.json";
+// Legacy filenames kept for cleanup on first run.
 const LITELLM_CACHE_FILENAME: &str = "litellm-pricing.json";
 const MODELS_DEV_CACHE_FILENAME: &str = "models-dev-pricing.json";
 // Anthropic date-suffixed model aliases use YYYYMMDD, while other numeric
@@ -61,12 +63,48 @@ impl Pricing {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct PricingMap {
     entries: FxHashMap<String, Pricing>,
     context_limits: FxHashMap<String, u64>,
     enable_models_dev_fallback: bool,
     enable_embedded_models_dev_fallback: bool,
+    /// Tracks model names that were looked up via `find()`. Used to write a
+    /// filtered cache containing only models the user actually uses.
+    used_models: Mutex<FxHashSet<String>>,
+    /// When true, the `Drop` impl will not write the filtered cache.
+    /// In test builds, defaults to true to avoid race conditions when
+    /// multiple tests create `PricingMap` instances concurrently.
+    /// Tests that specifically test Drop behavior can set this to false.
+    #[cfg(test)]
+    skip_drop_cache_write: bool,
+}
+
+#[cfg(test)]
+impl Default for PricingMap {
+    fn default() -> Self {
+        Self {
+            entries: FxHashMap::default(),
+            context_limits: FxHashMap::default(),
+            enable_models_dev_fallback: false,
+            enable_embedded_models_dev_fallback: false,
+            used_models: Mutex::new(FxHashSet::default()),
+            skip_drop_cache_write: true,
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl Default for PricingMap {
+    fn default() -> Self {
+        Self {
+            entries: FxHashMap::default(),
+            context_limits: FxHashMap::default(),
+            enable_models_dev_fallback: false,
+            enable_embedded_models_dev_fallback: false,
+            used_models: Mutex::new(FxHashSet::default()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,11 +274,11 @@ impl PricingMap {
                             "WARN  Failed to fetch LiteLLM pricing ({error}); trying local cache."
                         );
                     }
-                    read_pricing_cache(LITELLM_CACHE_FILENAME)
+                    read_pricing_cache(FILTERED_CACHE_FILENAME)
                 }
             }
         } else {
-            read_pricing_cache(LITELLM_CACHE_FILENAME)
+            read_pricing_cache(FILTERED_CACHE_FILENAME)
         };
 
         if let Some(ref json) = litellm_json {
@@ -250,8 +288,10 @@ impl PricingMap {
             }
         }
 
-        map.enable_models_dev_fallback =
-            !offline || read_pricing_cache(MODELS_DEV_CACHE_FILENAME).is_some();
+        // Enable models.dev network fallback when online; when offline, rely
+        // on the filtered cache (which may contain previously-resolved
+        // models.dev entries) and the embedded snapshot.
+        map.enable_models_dev_fallback = !offline;
         map.apply_overrides(overrides);
         map
     }
@@ -373,6 +413,10 @@ impl PricingMap {
     }
 
     pub(crate) fn find(&self, model: &str) -> Option<Pricing> {
+        // Track the model lookup so we can write a filtered cache on drop.
+        if let Ok(mut used) = self.used_models.lock() {
+            used.insert(model.to_string());
+        }
         let alias = crate::model_aliases::resolve_model_name(model);
         let resolved_alias = alias.as_ref();
         self.find_entry_or_alias(model)
@@ -420,6 +464,10 @@ impl PricingMap {
     }
 
     pub(crate) fn context_limit(&self, model: &str) -> Option<u64> {
+        // Track the model lookup so we can write a filtered cache on drop.
+        if let Ok(mut used) = self.used_models.lock() {
+            used.insert(model.to_string());
+        }
         let alias = crate::model_aliases::resolve_model_name(model);
         let resolved_alias = alias.as_ref();
         self.context_limit_entry_or_alias(model)
@@ -1025,6 +1073,122 @@ impl PricingMap {
             self.context_limits.insert(model.to_string(), 200_000);
         }
     }
+
+    /// Write a filtered pricing cache containing only the specified models.
+    /// The cache is written in LiteLLM JSON format to `pricing-filtered.json`.
+    fn write_filtered_cache_for(&self, used: &[String]) {
+        let Some(dir) = pricing_cache_dir() else {
+            return;
+        };
+        if let Err(error) = fs::create_dir_all(&dir) {
+            if should_log_pricing_refresh_details() {
+                eprintln!("WARN  Failed to create pricing cache directory {dir:?}: {error}");
+            }
+            return;
+        }
+
+        let mut filtered = serde_json::Map::new();
+        for model in used {
+            // Re-use find() to resolve the model through all sources (entries,
+            // models.dev fallback, embedded fallback). Skip models that can't
+            // be resolved — they have no pricing to cache.
+            let Some(pricing) = self.find(model) else {
+                continue;
+            };
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "input_cost_per_token".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(pricing.input).unwrap_or_else(|| {
+                        serde_json::Number::from_f64(0.0).unwrap()
+                    }),
+                ),
+            );
+            entry.insert(
+                "output_cost_per_token".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(pricing.output).unwrap_or_else(|| {
+                        serde_json::Number::from_f64(0.0).unwrap()
+                    }),
+                ),
+            );
+            if pricing.cache_read_explicit || pricing.cache_create > 0.0 {
+                entry.insert(
+                    "cache_creation_input_token_cost".to_string(),
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(pricing.cache_create).unwrap_or_else(|| {
+                            serde_json::Number::from_f64(0.0).unwrap()
+                        }),
+                    ),
+                );
+            }
+            if pricing.cache_read_explicit || pricing.cache_read > 0.0 {
+                entry.insert(
+                    "cache_read_input_token_cost".to_string(),
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(pricing.cache_read).unwrap_or_else(|| {
+                            serde_json::Number::from_f64(0.0).unwrap()
+                        }),
+                    ),
+                );
+            }
+            if let Some(limit) = self.context_limits.get(model).copied().or_else(|| {
+                // Try to find the context limit via the resolved model name.
+                self.context_limit(model)
+            }) {
+                entry.insert(
+                    "max_input_tokens".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(limit)),
+                );
+            }
+            filtered.insert(model.clone(), serde_json::Value::Object(entry));
+        }
+
+        if filtered.is_empty() {
+            return;
+        }
+
+        let json = match serde_json::to_string_pretty(&serde_json::Value::Object(filtered)) {
+            Ok(json) => json,
+            Err(error) => {
+                if should_log_pricing_refresh_details() {
+                    eprintln!("WARN  Failed to serialize filtered pricing cache: {error}");
+                }
+                return;
+            }
+        };
+
+        let path = dir.join(FILTERED_CACHE_FILENAME);
+        if let Err(error) = fs::write(&path, &json) {
+            if should_log_pricing_refresh_details() {
+                eprintln!("WARN  Failed to write filtered pricing cache {path:?}: {error}");
+            }
+        }
+    }
+}
+
+impl Drop for PricingMap {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if self.skip_drop_cache_write {
+            return;
+        }
+        // Extract used models first to avoid holding the lock during find()
+        // calls inside write_filtered_cache_for.
+        let used: Vec<String> = match self.used_models.lock() {
+            Ok(set) => set.iter().cloned().collect(),
+            Err(_) => return,
+        };
+        if used.is_empty() {
+            return;
+        }
+        self.write_filtered_cache_for(&used);
+        // Clean up legacy full-cache files that are no longer needed.
+        if let Some(dir) = pricing_cache_dir() {
+            let _ = fs::remove_file(dir.join(LITELLM_CACHE_FILENAME));
+            let _ = fs::remove_file(dir.join(MODELS_DEV_CACHE_FILENAME));
+        }
+    }
 }
 
 fn parse_litellm_pricing(value: Value) -> Option<LiteLlmPricing> {
@@ -1228,21 +1392,17 @@ where
 }
 
 fn fetch_pricing_json() -> std::io::Result<String> {
-    let json = fetch_json_url(LITELLM_PRICING_URL)?;
-    write_pricing_cache(LITELLM_CACHE_FILENAME, &json);
-    Ok(json)
+    fetch_json_url(LITELLM_PRICING_URL)
 }
 
 fn fetch_models_dev_json() -> std::io::Result<String> {
     match fetch_json_url(MODELS_DEV_API_URL) {
-        Ok(json) => {
-            write_pricing_cache(MODELS_DEV_CACHE_FILENAME, &json);
-            Ok(json)
-        }
+        Ok(json) => Ok(json),
         Err(network_error) => {
-            // Fall back to local cache when the network is unavailable so that
-            // offline runs still benefit from models.dev pricing data.
-            if let Some(cached) = read_pricing_cache(MODELS_DEV_CACHE_FILENAME) {
+            // Fall back to local filtered cache when the network is unavailable
+            // so that offline runs still benefit from previously-resolved
+            // models.dev pricing data.
+            if let Some(cached) = read_pricing_cache(FILTERED_CACHE_FILENAME) {
                 Ok(cached)
             } else {
                 Err(network_error)
@@ -1282,6 +1442,7 @@ fn pricing_cache_dir() -> Option<PathBuf> {
     Some(path)
 }
 
+#[cfg(test)]
 fn write_pricing_cache(filename: &str, json: &str) {
     let Some(dir) = pricing_cache_dir() else {
         return;
@@ -2457,30 +2618,39 @@ mod tests {
 
     mod pricing_cache {
         use super::super::{
-            LITELLM_CACHE_FILENAME, MODELS_DEV_CACHE_FILENAME, read_pricing_cache,
-            write_pricing_cache,
+            LITELLM_CACHE_FILENAME, MODELS_DEV_CACHE_FILENAME,
+            read_pricing_cache, write_pricing_cache,
         };
         use std::fs;
+
+        // Use a test-specific filename to avoid race conditions with other
+        // tests that may write to the real FILTERED_CACHE_FILENAME via Drop.
+        const TEST_CACHE_FILENAME: &str = "pricing-test.json";
 
         fn cache_cleanup_guard() -> CacheCleanup {
             CacheCleanup::new()
         }
 
         struct CacheCleanup {
+            test_existed: bool,
+            test_backup: Option<String>,
             litellm_existed: bool,
-            models_dev_existed: bool,
             litellm_backup: Option<String>,
+            models_dev_existed: bool,
             models_dev_backup: Option<String>,
         }
 
         impl CacheCleanup {
             fn new() -> Self {
+                let test_backup = read_pricing_cache(TEST_CACHE_FILENAME);
                 let litellm_backup = read_pricing_cache(LITELLM_CACHE_FILENAME);
                 let models_dev_backup = read_pricing_cache(MODELS_DEV_CACHE_FILENAME);
                 Self {
+                    test_existed: test_backup.is_some(),
+                    test_backup,
                     litellm_existed: litellm_backup.is_some(),
-                    models_dev_existed: models_dev_backup.is_some(),
                     litellm_backup,
+                    models_dev_existed: models_dev_backup.is_some(),
                     models_dev_backup,
                 }
             }
@@ -2489,8 +2659,14 @@ mod tests {
         impl Drop for CacheCleanup {
             fn drop(&mut self) {
                 if let Some(dir) = super::super::pricing_cache_dir() {
+                    let test_path = dir.join(TEST_CACHE_FILENAME);
                     let litellm_path = dir.join(LITELLM_CACHE_FILENAME);
                     let models_dev_path = dir.join(MODELS_DEV_CACHE_FILENAME);
+                    if !self.test_existed {
+                        let _ = fs::remove_file(&test_path);
+                    } else if let Some(ref content) = self.test_backup {
+                        let _ = fs::write(&test_path, content);
+                    }
                     if !self.litellm_existed {
                         let _ = fs::remove_file(&litellm_path);
                     } else if let Some(ref content) = self.litellm_backup {
@@ -2506,23 +2682,13 @@ mod tests {
         }
 
         #[test]
-        fn writes_and_reads_litellm_cache() {
+        fn writes_and_reads_filtered_cache() {
             let _cleanup = cache_cleanup_guard();
             let json = r#"{"test-model":{"input_cost_per_token":1e-6,"output_cost_per_token":2e-6}}"#;
 
-            write_pricing_cache(LITELLM_CACHE_FILENAME, json);
-            let cached = read_pricing_cache(LITELLM_CACHE_FILENAME).expect("cache should exist");
-            assert_eq!(cached, json);
-        }
-
-        #[test]
-        fn writes_and_reads_models_dev_cache() {
-            let _cleanup = cache_cleanup_guard();
-            let json = r#"{"test":{"id":"test","cost":{"input":1.0,"output":2.0}}}"#;
-
-            write_pricing_cache(MODELS_DEV_CACHE_FILENAME, json);
+            write_pricing_cache(TEST_CACHE_FILENAME, json);
             let cached =
-                read_pricing_cache(MODELS_DEV_CACHE_FILENAME).expect("cache should exist");
+                read_pricing_cache(TEST_CACHE_FILENAME).expect("cache should exist");
             assert_eq!(cached, json);
         }
 
@@ -2531,16 +2697,77 @@ mod tests {
             let _cleanup = cache_cleanup_guard();
             // Remove any existing cache first
             if let Some(dir) = super::super::pricing_cache_dir() {
-                let _ = fs::remove_file(dir.join(LITELLM_CACHE_FILENAME));
+                let _ = fs::remove_file(dir.join(TEST_CACHE_FILENAME));
             }
-            assert!(read_pricing_cache(LITELLM_CACHE_FILENAME).is_none());
+            assert!(read_pricing_cache(TEST_CACHE_FILENAME).is_none());
         }
 
         #[test]
         fn read_returns_none_for_empty_cache_file() {
             let _cleanup = cache_cleanup_guard();
-            write_pricing_cache(LITELLM_CACHE_FILENAME, "   \n  ");
-            assert!(read_pricing_cache(LITELLM_CACHE_FILENAME).is_none());
+            write_pricing_cache(TEST_CACHE_FILENAME, "   \n  ");
+            assert!(read_pricing_cache(TEST_CACHE_FILENAME).is_none());
+        }
+
+        #[test]
+        fn drop_writes_filtered_cache_for_used_models() {
+            let _cleanup = cache_cleanup_guard();
+            // Remove any existing filtered cache.
+            if let Some(dir) = super::super::pricing_cache_dir() {
+                let _ = fs::remove_file(dir.join(super::super::FILTERED_CACHE_FILENAME));
+            }
+
+            {
+                let mut pricing = super::super::PricingMap::default();
+                pricing.skip_drop_cache_write = false; // Enable Drop cache writing for this test.
+                pricing.entries.insert(
+                    "used-model".to_string(),
+                    super::super::Pricing {
+                        input: 1e-6,
+                        output: 2e-6,
+                        cache_create: 1.25e-6,
+                        cache_read: 0.1e-6,
+                        cache_read_explicit: true,
+                        input_above_200k: None,
+                        output_above_200k: None,
+                        cache_create_above_200k: None,
+                        cache_read_above_200k: None,
+                        fast_multiplier: 1.0,
+                    },
+                );
+                // Look up the model to track it.
+                let result = pricing.find("used-model");
+                assert!(result.is_some());
+                // PricingMap is dropped here, which should write the filtered cache.
+            }
+
+            let cached =
+                read_pricing_cache(super::super::FILTERED_CACHE_FILENAME).expect("filtered cache should exist");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&cached).expect("valid JSON");
+            assert!(
+                parsed.get("used-model").is_some(),
+                "filtered cache should contain used-model"
+            );
+        }
+
+        #[test]
+        fn drop_does_not_write_cache_when_no_models_used() {
+            let _cleanup = cache_cleanup_guard();
+            // Remove any existing filtered cache.
+            if let Some(dir) = super::super::pricing_cache_dir() {
+                let _ = fs::remove_file(dir.join(super::super::FILTERED_CACHE_FILENAME));
+            }
+
+            {
+                let _pricing = super::super::PricingMap::default();
+                // PricingMap is dropped here without any find() calls.
+            }
+
+            assert!(
+                read_pricing_cache(super::super::FILTERED_CACHE_FILENAME).is_none(),
+                "filtered cache should not be written when no models were used"
+            );
         }
     }
 }
