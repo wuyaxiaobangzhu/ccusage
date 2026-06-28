@@ -114,6 +114,7 @@ pub struct StatuslineArgs {
     pub config: Option<PathBuf>,
     pub debug: bool,
     pub model_label_aliases: HashMap<String, String>,
+    pub no_block: bool,
 }
 
 #[derive(Clone)]
@@ -170,6 +171,7 @@ impl Default for StatuslineArgs {
             config: None,
             debug: false,
             model_label_aliases: HashMap::new(),
+            no_block: false,
         }
     }
 }

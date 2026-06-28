@@ -12,8 +12,8 @@ use serde_json::json;
 use crate::pricing::PricingMap;
 use crate::{
     BucketKind, Color, Context, DEFAULT_RECENT_DAYS, DEFAULT_SESSION_DURATION_HOURS,
-    MILLIS_PER_DAY, MILLIS_PER_MINUTE, Result, SessionAccumulator, TimestampMs, block_json,
-    calculate_burn_rate,
+    MILLIS_PER_DAY, MILLIS_PER_MINUTE, LoadedEntry, Result, SessionAccumulator, TimestampMs,
+    block_json, calculate_burn_rate,
     cli::{
         BlocksArgs, CostSource, DailyArgs, SessionArgs, SharedArgs, SortOrder, StatuslineArgs,
         VisualBurnRate, WeekDay, WeeklyArgs,
@@ -273,7 +273,7 @@ pub(crate) fn run_blocks(args: BlocksArgs) -> Result<()> {
     }
     let shared = args.shared.clone();
     let entries = load_entries(&shared, None)?;
-    let mut blocks = identify_session_blocks(entries, args.session_length);
+    let mut blocks = identify_session_blocks(&entries, args.session_length);
     filter_blocks_by_date(&mut blocks, &shared);
     sort_blocks(&mut blocks, &shared.order);
 
@@ -407,19 +407,30 @@ fn render_statusline(
     args: &StatuslineArgs,
     shared: &SharedArgs,
 ) -> Result<String> {
+    // 只加载一次数据，避免重复读取所有 JSONL 文件
+    let all_entries = load_entries(shared, None).ok();
+
     let session_cost = match args.cost_source {
         CostSource::Cc => hook.cost.as_ref().map(|cost| cost.total_cost_usd),
-        CostSource::Ccusage => calculate_session_cost(&hook.session_id, shared).ok(),
+        CostSource::Ccusage => all_entries
+            .as_ref()
+            .map(|entries| calculate_session_cost_from_entries(&hook.session_id, entries)),
         CostSource::Auto => hook
             .cost
             .as_ref()
             .map(|cost| cost.total_cost_usd)
-            .or_else(|| calculate_session_cost(&hook.session_id, shared).ok()),
+            .or_else(|| {
+                all_entries
+                    .as_ref()
+                    .map(|entries| calculate_session_cost_from_entries(&hook.session_id, entries))
+            }),
         CostSource::Both => None,
     };
 
     let ccusage_cost = if args.cost_source == CostSource::Both {
-        calculate_session_cost(&hook.session_id, shared).ok()
+        all_entries
+            .as_ref()
+            .map(|entries| calculate_session_cost_from_entries(&hook.session_id, entries))
     } else {
         None
     };
@@ -430,7 +441,8 @@ fn render_statusline(
     };
 
     let today_shared = statusline_today_shared(args, shared, utc_now());
-    let today_cost = load_entries(&today_shared, None)
+    let today_cost = all_entries
+        .as_ref()
         .map(|entries| {
             entries
                 .iter()
@@ -442,11 +454,15 @@ fn render_statusline(
         })
         .unwrap_or(0.0);
 
-    let blocks = load_entries(shared, None)
+    let blocks = all_entries
+        .as_ref()
         .map(|entries| identify_session_blocks(entries, DEFAULT_SESSION_DURATION_HOURS))
         .unwrap_or_default();
     let active_block = blocks.iter().find(|block| block.is_active && !block.is_gap);
-    let (block_info, burn_rate_info) = if let Some(block) = active_block {
+    let (block_info, burn_rate_info) = if args.no_block {
+        // 如果指定了 --no-block，不显示 block 信息
+        (String::new(), String::new())
+    } else if let Some(block) = active_block {
         let remaining = block.end_time.duration_since(utc_now()) / MILLIS_PER_MINUTE;
         let mut burn = String::new();
         if let Some(rate) = calculate_burn_rate(block) {
@@ -519,15 +535,26 @@ fn render_statusline(
 
     let model_label = resolve_model_label(&args.model_label_aliases, &hook.model.display_name);
 
-    Ok(format!(
-        "🤖 {} | 💰 {} session / {} today / {}{} | 🧠 {}",
-        model_label,
-        session_display,
-        format_currency(today_cost),
-        block_info,
-        burn_rate_info,
-        context_info.unwrap_or_else(|| "N/A".to_string())
-    ))
+    // 根据是否显示 block 信息调整输出格式
+    if args.no_block {
+        Ok(format!(
+            "🤖 {} | 💰 {} session / {} today | 🧠 {}",
+            model_label,
+            session_display,
+            format_currency(today_cost),
+            context_info.unwrap_or_else(|| "N/A".to_string())
+        ))
+    } else {
+        Ok(format!(
+            "🤖 {} | 💰 {} session / {} today / {}{} | 🧠 {}",
+            model_label,
+            session_display,
+            format_currency(today_cost),
+            block_info,
+            burn_rate_info,
+            context_info.unwrap_or_else(|| "N/A".to_string())
+        ))
+    }
 }
 
 fn statusline_today_shared(
@@ -557,6 +584,17 @@ fn calculate_session_cost(session_id: &str, shared: &SharedArgs) -> Result<f64> 
         .sum())
 }
 
+fn calculate_session_cost_from_entries(session_id: &str, entries: &[LoadedEntry]) -> f64 {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.data.session_id.as_deref() == Some(session_id)
+                || entry.session_id.as_ref() == session_id
+        })
+        .map(|entry| entry.cost)
+        .sum()
+}
+
 fn format_statusline_context(
     input_tokens: u64,
     context_limit: u64,
@@ -571,9 +609,29 @@ fn format_statusline_context(
     let context_color = statusline_context_color(percentage, args);
     format!(
         "{} ({})",
-        format_number(input_tokens),
+        format_tokens_compact(input_tokens),
         color(shared, format!("{percentage}%"), context_color)
     )
+}
+
+/// 紧凑格式化 token 数量：超过 1k 显示为 xxk，超过 1M 显示为 xM
+fn format_tokens_compact(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        // 超过 1M，显示为 xM（保留一位小数）
+        let millions = tokens as f64 / 1_000_000.0;
+        if millions >= 10.0 {
+            format!("{:.0}M", millions)
+        } else {
+            format!("{:.1}M", millions)
+        }
+    } else if tokens >= 1_000 {
+        // 超过 1k，显示为 xxk
+        let thousands = tokens / 1_000;
+        format!("{thousands}k")
+    } else {
+        // 小于 1k，直接显示
+        format!("{tokens}")
+    }
 }
 
 fn statusline_context_color(percentage: u64, args: &StatuslineArgs) -> Color {

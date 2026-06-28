@@ -182,6 +182,7 @@ fn parse_command(
                     "-z" | "--timezone" => args.timezone = Some(parser.value_for("--timezone")?),
                     "--config" => args.config = Some(PathBuf::from(parser.value_for("--config")?)),
                     "--debug" => args.debug = true,
+                    "--no-block" => args.no_block = true,
                     flag => return Err(format!("Unknown statusline option '{flag}'")),
                 }
             }

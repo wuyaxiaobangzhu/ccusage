@@ -15,20 +15,22 @@ use crate::{
 };
 
 pub(crate) fn identify_session_blocks(
-    mut entries: Vec<LoadedEntry>,
+    entries: &[LoadedEntry],
     session_duration_hours: f64,
 ) -> Vec<SessionBlock> {
     if entries.is_empty() {
         return Vec::new();
     }
     let session_duration = (session_duration_hours * MILLIS_PER_HOUR as f64) as i64;
-    entries.sort_by_key(|entry| entry.timestamp);
+    // 创建排序后的副本，避免修改原始数据
+    let mut sorted_entries = entries.to_vec();
+    sorted_entries.sort_by_key(|entry| entry.timestamp);
     let now = utc_now();
     let mut blocks = Vec::new();
     let mut current_start: Option<TimestampMs> = None;
     let mut current_entries = Vec::new();
 
-    for entry in entries {
+    for entry in sorted_entries {
         if let Some(start) = current_start {
             let last_time = current_entries
                 .last()
