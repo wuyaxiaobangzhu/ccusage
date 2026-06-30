@@ -109,19 +109,19 @@ See [Cost Source Options](#cost-source-options) section for all available modes.
 The statusline displays a compact, single-line summary:
 
 ```text
-🤖 Opus 4.1 | 💰 $0.23 session / $1.23 today / $0.45 block (2h 45m left) | 🔥 $0.12/hr | 🧠 25,000 (12%)
+🤖 Opus 4.1 | 💰 $0.23 curr / $1.23 today / $0.45 block (2h 45m left) | 🔥 $0.12/hr | 🧠 25,000 (12%)
 ```
 
 When using `--cost-source both`, the session cost shows both Claude Code and ccusage calculations:
 
 ```text
-🤖 Opus 4.1 | 💰 ($0.25 cc / $0.23 ccusage) session / $1.23 today / $0.45 block (2h 45m left) | 🔥 $0.12/hr | 🧠 25,000 (12%)
+🤖 Opus 4.1 | 💰 ($0.25 cc / $0.23 ccusage) curr / $1.23 today / $0.45 block (2h 45m left) | 🔥 $0.12/hr | 🧠 25,000 (12%)
 ```
 
 ### Components Explained
 
 - **Model** (`🤖 Opus 4.1`): Currently active Claude model
-- **Session Cost** (`💰 $0.23 session`): Cost for the current conversation session (see [Cost Source Options](#cost-source-options) for different calculation modes)
+- **Session Cost** (`💰 $0.23 curr`): Cost for the current conversation session (see [Cost Source Options](#cost-source-options) for different calculation modes)
 - **Today's Cost** (`$1.23 today`): Total cost for the current day across all sessions
 - **Session Block** (`$0.45 block (2h 45m left)`): Current 5-hour block cost with remaining time
 - **Burn Rate** (`🔥 $0.12/hr`): Cost burn rate per hour with color-coded indicators:
@@ -138,7 +138,7 @@ When using `--cost-source both`, the session cost shows both Claude Code and ccu
 When no active block exists:
 
 ```text
-🤖 Opus 4.1 | 💰 $0.00 session / $0.00 today / No active block
+🤖 Opus 4.1 | 💰 $0.00 curr / $0.00 today / No active block
 ```
 
 ## Technical Details
@@ -209,8 +209,8 @@ bun x ccusage statusline --cost-source both
 
 **Output differences:**
 
-- **Single cost modes** (`auto`, `ccusage`, `cc`): `💰 $0.23 session`
-- **Both mode**: `💰 ($0.25 cc / $0.23 ccusage) session`
+- **Single cost modes** (`auto`, `ccusage`, `cc`): `💰 $0.23 curr`
+- **Both mode**: `💰 ($0.25 cc / $0.23 ccusage) curr`
 
 ## Configuration
 

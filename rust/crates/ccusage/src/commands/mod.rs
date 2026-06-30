@@ -357,7 +357,10 @@ pub(crate) fn run_statusline(args: StatuslineArgs) -> Result<()> {
         mark_statusline_cache_updating(&cache_path, &hook, current_mtime, initial_cache.as_ref());
     }
 
-    let statusline_result = render_statusline(&hook, &args, &shared);
+    // Run `ccusage claude --offline --json` to get today's and total usage data
+    let claude_usage = run_ccusage_clade_offline_json();
+
+    let statusline_result = render_statusline(&hook, &args, &shared, claude_usage.as_ref());
     match statusline_result {
         Ok(statusline) => {
             println!("{statusline}");
@@ -386,6 +389,92 @@ pub(crate) fn run_statusline(args: StatuslineArgs) -> Result<()> {
     Ok(())
 }
 
+/// Result from parsing `ccusage claude --offline --json` output.
+#[derive(Debug, Default)]
+struct ClaudeUsageData {
+    today_tokens: u64,
+    today_cost: f64,
+    total_tokens: u64,
+    total_cost: f64,
+}
+
+/// Execute `ccusage claude --offline --json` and parse its output.
+///
+/// Expected JSON structure from `ccusage claude`:
+/// ```json
+/// {
+///   "daily": [{ "date": "20260629", "totalTokens": 12345, "totalCost": 1.23, ... }],
+///   "totals": { "totalTokens": 999999, "totalCost": 99.99, ... }
+/// }
+/// ```
+fn run_ccusage_clade_offline_json() -> Option<ClaudeUsageData> {
+    let output = std::process::Command::new("ccusage")
+        .args(["claude", "--offline", "--json"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+
+    // Get today's date string in YYYYMMDD format
+    let today = {
+        let now = utc_now();
+        format_date(now, None).replace('-', "")
+    };
+
+    // Parse today's data from the "daily" array
+    let (today_tokens, today_cost) = value
+        .get("daily")
+        .and_then(|daily| daily.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|item| {
+                    item.get("date")
+                        .and_then(|d| d.as_str())
+                        .is_some_and(|d| d == today)
+                })
+                .map(|item| {
+                    let tokens = item
+                        .get("totalTokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_default();
+                    let cost = item
+                        .get("totalCost")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or_default();
+                    (tokens, cost)
+                })
+        })
+        .unwrap_or_default();
+
+    // Parse total data from "totals"
+    let (total_tokens, total_cost) = value
+        .get("totals")
+        .map(|totals| {
+            let tokens = totals
+                .get("totalTokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default();
+            let cost = totals
+                .get("totalCost")
+                .and_then(|v| v.as_f64())
+                .unwrap_or_default();
+            (tokens, cost)
+        })
+        .unwrap_or_default();
+
+    Some(ClaudeUsageData {
+        today_tokens,
+        today_cost,
+        total_tokens,
+        total_cost,
+    })
+}
+
 /// Resolve the model label shown in the statusline.
 ///
 /// Looks up the model's `display_name` in the user-configured alias map and
@@ -406,6 +495,7 @@ fn render_statusline(
     hook: &StatuslineHook,
     args: &StatuslineArgs,
     shared: &SharedArgs,
+    claude_usage: Option<&ClaudeUsageData>,
 ) -> Result<String> {
     // 只加载一次数据，避免重复读取所有 JSONL 文件
     let all_entries = load_entries(shared, None).ok();
@@ -440,19 +530,30 @@ fn render_statusline(
         None
     };
 
-    let today_shared = statusline_today_shared(args, shared, utc_now());
-    let today_cost = all_entries
-        .as_ref()
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|entry| {
-                    entry.date.replace('-', "") == today_shared.since.as_deref().unwrap_or_default()
+    // Today's cost and tokens come from `ccusage claude --offline --json`
+    let today_cost = claude_usage
+        .map(|u| u.today_cost)
+        .unwrap_or_else(|| {
+            let today_shared = statusline_today_shared(args, shared, utc_now());
+            all_entries
+                .as_ref()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.date.replace('-', "")
+                                == today_shared.since.as_deref().unwrap_or_default()
+                        })
+                        .map(|entry| entry.cost)
+                        .sum::<f64>()
                 })
-                .map(|entry| entry.cost)
-                .sum::<f64>()
-        })
-        .unwrap_or(0.0);
+                .unwrap_or(0.0)
+        });
+    let today_tokens = claude_usage.map(|u| u.today_tokens).unwrap_or_default();
+
+    // Total cost and tokens come from `ccusage claude --offline --json`
+    let total_tokens = claude_usage.map(|u| u.total_tokens).unwrap_or_default();
+    let total_cost = claude_usage.map(|u| u.total_cost).unwrap_or_default();
 
     let blocks = all_entries
         .as_ref()
@@ -540,7 +641,7 @@ fn render_statusline(
         // --no-block: 隐藏 block 信息，但保留燃烧率
         if burn_rate_info.is_empty() {
             Ok(format!(
-                "🤖 {} | 💰 {} session / {} today | 🧠 {}",
+                "🤖 {} | 💰 {} curr / {} today | 🧠 {}",
                 model_label,
                 session_display,
                 format_currency(today_cost),
@@ -548,7 +649,7 @@ fn render_statusline(
             ))
         } else {
             Ok(format!(
-                "🤖 {} | 💰 {} session / {} today{} | 🧠 {}",
+                "🤖 {} | 💰 {} curr / {} today{} | 🧠 {}",
                 model_label,
                 session_display,
                 format_currency(today_cost),
@@ -558,7 +659,7 @@ fn render_statusline(
         }
     } else {
         Ok(format!(
-            "🤖 {} | 💰 {} session / {} today / {}{} | 🧠 {}",
+            "🤖 {} | 💰 {} curr / {} today / {}{} | 🧠 {}",
             model_label,
             session_display,
             format_currency(today_cost),
