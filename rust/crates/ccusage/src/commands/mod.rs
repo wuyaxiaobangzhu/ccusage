@@ -392,18 +392,16 @@ pub(crate) fn run_statusline(args: StatuslineArgs) -> Result<()> {
 /// Result from parsing `ccusage claude --offline --json` output.
 #[derive(Debug, Default)]
 struct ClaudeUsageData {
-    today_tokens: u64,
     today_cost: f64,
-    total_tokens: u64,
-    total_cost: f64,
 }
 
 /// Execute `ccusage claude --offline --json` and parse its output.
 ///
-/// Expected JSON structure from `ccusage claude`:
+/// Only today's cost is extracted (from the `daily` array); the rest of the
+/// document is ignored. Expected JSON shape from `ccusage claude`:
 /// ```json
 /// {
-///   "daily": [{ "date": "20260629", "totalTokens": 12345, "totalCost": 1.23, ... }],
+///   "daily": [{ "date": "20260629", "totalCost": 1.23, ... }],
 ///   "totals": { "totalTokens": 999999, "totalCost": 99.99, ... }
 /// }
 /// ```
@@ -426,8 +424,8 @@ fn run_ccusage_clade_offline_json() -> Option<ClaudeUsageData> {
         format_date(now, None).replace('-', "")
     };
 
-    // Parse today's data from the "daily" array
-    let (today_tokens, today_cost) = value
+    // Parse today's cost from the "daily" array
+    let today_cost = value
         .get("daily")
         .and_then(|daily| daily.as_array())
         .and_then(|arr| {
@@ -437,42 +435,12 @@ fn run_ccusage_clade_offline_json() -> Option<ClaudeUsageData> {
                         .and_then(|d| d.as_str())
                         .is_some_and(|d| d == today)
                 })
-                .map(|item| {
-                    let tokens = item
-                        .get("totalTokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or_default();
-                    let cost = item
-                        .get("totalCost")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or_default();
-                    (tokens, cost)
-                })
-        })
-        .unwrap_or_default();
-
-    // Parse total data from "totals"
-    let (total_tokens, total_cost) = value
-        .get("totals")
-        .map(|totals| {
-            let tokens = totals
-                .get("totalTokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or_default();
-            let cost = totals
-                .get("totalCost")
+                .and_then(|item| item.get("totalCost"))
                 .and_then(|v| v.as_f64())
-                .unwrap_or_default();
-            (tokens, cost)
         })
         .unwrap_or_default();
 
-    Some(ClaudeUsageData {
-        today_tokens,
-        today_cost,
-        total_tokens,
-        total_cost,
-    })
+    Some(ClaudeUsageData { today_cost })
 }
 
 /// Resolve the model label shown in the statusline.
@@ -549,12 +517,6 @@ fn render_statusline(
                 })
                 .unwrap_or(0.0)
         });
-    let today_tokens = claude_usage.map(|u| u.today_tokens).unwrap_or_default();
-
-    // Total cost and tokens come from `ccusage claude --offline --json`
-    let total_tokens = claude_usage.map(|u| u.total_tokens).unwrap_or_default();
-    let total_cost = claude_usage.map(|u| u.total_cost).unwrap_or_default();
-
     let blocks = all_entries
         .as_ref()
         .map(|entries| identify_session_blocks(entries, DEFAULT_SESSION_DURATION_HOURS))
